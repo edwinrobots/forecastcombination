@@ -33,26 +33,26 @@ class BayesianForecasterCombination():
     # targets are inferred simultaneously, we have *uncertain inputs*. 
     # e = [] # N x F unscaled noise. Expected value = posterior mean for each data point. # e has mean zero, 
     # and precision v_e, which is scaled by b. v_e increases with time and can vary with y.
-    b = [] # N x F noise scale 
+    b = [] # N x N x F noise scale 
     c = [] # F bias. Expected value = posterior mean
     
     lambda_e = [] # F degrees of freedom in student's t distribution over noise 
     
     # Posterior variances over the model params at each data point
     v_a = [] # N x F Posterior variance of a at each time step
-    Lambda_e = [] # N x F Unscaled noise precision at each time step. Referred to as Lambda in Zhu, Leung & He
+    Lambda_e = [] # N x N x F Unscaled noise precision at each time step. Referred to as Lambda in Zhu, Leung & He
     v_c = [] # F bias variance
     v_y = [] # N posterior target variance
     cov_y = []
     
-    scale_b = [] # N x F posterior parameters for the noise scale gamma distribution. I don't think this needs to vary with
+    shape_b = [] # N x F posterior parameters for the noise scale gamma distribution. I don't think this needs to vary with
     # time or targets since v_e already varies. Since v_e and b are multiplied, scaling v_e has the same effect as scaling b.
     rate_b = [] # N x F
     
-    scale_Lambda = [] # N x F
+    shape_Lambda = [] # N x F
     rate_Lambda = [] # N x F
     
-    scale_lambda = [] # N x F expected value of lambda, the degree of freedom of the student t noise distribution. Used to determine scale_b
+    shape_lambda = [] # N x F expected value of lambda, the degree of freedom of the student t noise distribution. Used to determine shape_b
     rate_lambda = [] # N x F 
     
     # Posterior means and covariance hyperparams for each forecaster's general behaviour    
@@ -82,13 +82,13 @@ class BayesianForecasterCombination():
     # Prior covariance for the signal strength as a function of time is given by an exponential kernel with hyperparams:
     s0_a = 1 # output scale
     
-    scale0_b = 1 # Priors for the noise
+    shape0_b = 1 # Priors for the noise
     rate0_b = 1 # 1
     
-    scale0_Lambda = 1 # 
+    shape0_Lambda = 1 # 
     rate0_Lambda = 1 #
     
-    scale0_lambda = 1 # 1
+    shape0_lambda = 1 # 1
     rate0_lambda = 1 # 1 
     
     s0_e = 1 # output scale of noise
@@ -222,7 +222,7 @@ class BayesianForecasterCombination():
         
         for f in range(self.F):
             innovation = self.x[:, f] - (self.y * self.mu0_a + self.c) # observation minus prior over forecasters' predictions 
-            invS = np.linalg.inv(y.dot(K).dot(y) + np.diag(1.0/(self.b[:, f]*self.Lambda_e[:, f])))# + self.v_c)
+            invS = np.linalg.inv(y.dot(K).dot(y) + np.linalg.inv(self.b[f]*self.Lambda_e[f]))# + self.v_c)
             kalmangain = K.dot(self.y).dot(invS)
             self.a[:, f] = kalmangain.dot(innovation)
             cov_a = K - kalmangain.dot(y).dot(K)
@@ -256,6 +256,8 @@ class BayesianForecasterCombination():
         self.v_c = np.diag(cov_c)                
                 
     def expec_b_and_e(self):
+        # Check that the updates for Lambda fit with those of a wishart. Should the updates for lambda also be for a (inverse) wishart? 
+        
         # update hyperparameters as necessary
         if not self.s_e:
             self.s_e = self.s0_e
@@ -280,20 +282,31 @@ class BayesianForecasterCombination():
         
         innovation = self.x - self.mu0_y * self.a - self.c # N x F
         
-        self.scale_b = (self.lambda_e + 1.0) * 0.5
-        traceterm = K_b.dot(innovation**2 + self.v_a + (self.a**2 + self.v_a) * self.v_y[:, np.newaxis]) * self.Lambda_e # N x F # + self.v_c
-        self.rate_b = (self.lambda_e + traceterm) * 0.5
-        
-        self.b = self.scale_b / self.rate_b # expectation of b
-        expec_log_b = psi(self.scale_b) - np.log(self.rate_b)
-                
-        # now update lambda 
-        self.scale_lambda = self.scale0_lambda + np.sum(K_lambda, axis=1)[:, np.newaxis] * 0.5 # Nx1
-        self.rate_lambda = self.rate0_lambda - 0.5 * K_lambda.dot(1 + expec_log_b - self.b) # NxF
-        self.lambda_e = self.scale_lambda / self.rate_lambda # N x F
-
-        # Update the distribution over the Lambda_e
-        self.scale_Lambda = self.scale0_Lambda + np.sum(K_e, axis=1)[:, np.newaxis] * 0.5 # Nx1
-        traceterm = K_e.dot( innovation**2 + self.v_a + (self.a**2 + self.v_a) * self.v_y[:, np.newaxis]) * self.b # N x F #  + self.v_c
-        self.rate_Lambda = self.rate0_Lambda + 0.5 * traceterm   
-        self.Lambda_e = self.scale_Lambda / self.rate_Lambda
+        # UPDATE b ---------------------------
+        for f in range(self.F):
+            # rate b is now square for each f because b relates to precision of e. Check the other equations involving b make sense.
+            self.shape_b = (self.lambda_e[f] + 1.0)
+            # How is lambda_e prior parameter for both shape and rate?
+            # Put the additional variance due to E[a^2] = E[a]^2 + V[a] in here and for the uncertainty in y -- think we just need self.v_a?
+            pairwise_dev_prods = np.linalg.inv(K_b)
+            self.rate_b = np.linalg.inv(pairwise_dev_prods + innovation[:, f].dot(innovation[f, :])) * self.Lambda_e[f]
+            
+    #         sum_sq_deviations = K_b.dot(innovation**2 + self.v_a + (self.a**2 + self.v_a) * self.v_y[:, np.newaxis]) * self.Lambda_e # N x F # + self.v_c
+            
+            self.b = self.shape_b / self.rate_b # expectation of b
+            expec_log_b = psi(self.shape_b) - np.log(self.rate_b)
+                    
+            # UPDATE lambda -----------------------
+            # How is this derived?
+            self.shape_lambda = self.shape0_lambda + np.sum(K_lambda, axis=1)[:, np.newaxis] * 0.5 # Nx1
+            self.rate_lambda = self.rate0_lambda - 0.5 * K_lambda.dot(1 + expec_log_b - self.b) # NxF
+            self.lambda_e = self.shape_lambda / self.rate_lambda # N x F
+    
+            # UPDATE Lambda ------------------------
+            self.shape_Lambda = self.shape0_Lambda + 0.5#np.sum(K_e, axis=1)[:, np.newaxis] * 0.5 # Nx1
+            # change this!
+            pairwise_dev_prods = np.linalg.inv(K_e)
+            sum_sq_deviations = np.linalg.inv(pairwise_dev_prods + innovation[:, f].dot(innovation[f, :])) * self.b 
+#             sum_sq_deviations = K_e.dot( innovation**2 + self.v_a + (self.a**2 + self.v_a) * self.v_y[:, np.newaxis]) * self.b # N x F #  + self.v_c
+            self.rate_Lambda = self.rate0_Lambda + 0.5 * sum_sq_deviations   
+            self.Lambda_e = self.shape_Lambda / self.rate_Lambda
