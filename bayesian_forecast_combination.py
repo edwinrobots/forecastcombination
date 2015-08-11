@@ -59,8 +59,6 @@ class BayesianForecasterCombination():
     s_a = [] # F posterior output scales 
     s_c = [] # F bias c absorbs any consistent bias at a given time/target point, so that there is still zero-mean noise e
     s_e = [] # F posterior output scales
-    s_b = []
-    s_lambda = []
 
     l_time = 10 # length scale for the forecasters' variation over time. Could be extended to differe for each forecaster.
     l_target = 10 # length scale fore the forecasters' variation over y-space.  
@@ -92,8 +90,6 @@ class BayesianForecasterCombination():
     rate0_lambda = 1 # 1 
     
     s0_e = 1 # output scale of noise
-    s0_b = 1 # 
-    s0_lambda = 1 #
     
     mu0_c = 0 # Prior mean bias
     s0_c = 1 # output scale of bias
@@ -121,9 +117,29 @@ class BayesianForecasterCombination():
             times = times[:, np.newaxis]
         if times.shape[1] == 1:
             times = np.tile(times, (1, self.F))
+            
+        self.times = times
+                    
+        if not self.l_time:
+            self.l_time = self.l0_time
+        if not self.l_target:
+            self.l_target = self.l0_target#
 
         # Initialise the parameter arrays...
-    
+        self.a = np.zeros((self.N, self.F))
+        self.b = np.zeros((self.N, self.F))
+        self.c = np.zeros((self.N, self.F))
+        self.Lambda_e = np.zeros((self.N, self.F))
+        self.lambda_e = np.zeros(self.F)
+        
+        self.v_a = np.zeros((self.N, self.F))
+        self.s_a = np.zeros(self.F) + self.s0_a
+        self.s_e = np.zeros(self.F) + self.s0_e
+        self.v_c = np.zeros((self.N, self.F))
+        self.s_c = np.zeros(self.F) + self.s0_c
+        self.v_y = np.zeros(self.N)
+        self.s_y = self.s0_y
+            
     def fit(self):
         """
         Run VB to fit the model and predict the latent variables y at the same time.
@@ -134,11 +150,20 @@ class BayesianForecasterCombination():
         change = np.inf
         maxiter = 100
         niter = 0
+
+        d_time = self.times - self.times.T        
+        
         while change > tolerance and niter < maxiter:
             
             logging.debug("Iteration " + str(niter))
             
             y_old = self.y
+            
+            d_y = self.y.T - self.y # using first and second order Taylor expansions for the uncertain inputs.
+            
+            K_time = np.exp(- 0.5 * d_time**2 / self.l_time**2 ) # squared exponential kernel
+            K_y = np.exp(- 0.5 * d_y**2 / self.l_target**2 ) # squared exponential kernel
+            self.K = self.s_a * K_time * K_y
             
             self.expec_y() # begin by estimating y from sensible priors
             self.expec_c() # find the added bias
@@ -152,7 +177,7 @@ class BayesianForecasterCombination():
         """
         Use the posterior GP over y to interpolate and predict the specified times and periods.
         """
-        distances = testtimes[np.newaxis, :] - self.times[:, np.newaxis]
+        distances = testtimes[:, np.newaxis] - self.times.T
         K_test_train = self.s_y * np.exp(- 0.5 * distances**2 / self.l_y**2 ) # squared exponential kernel   
 
         distances = testtimes[np.newaxis, :] - testtimes[:, np.newaxis]
@@ -168,61 +193,53 @@ class BayesianForecasterCombination():
         return y, v_y    
  
     def expec_y(self):
+        innovation = self.x - (self.mu0_y * self.a + self.c) # observation minus prior over forecasters' predictions
+        innovation = innovation.flatten()[:, np.newaxis]
+        
         # Uncertainty in self.a?  
         # update hyperparameters as necessary
-        if not self.s_y:
-            self.s_y = self.s0_y
-#         else:
-#             self.s_y = # variational update -- see gpgrid and the bird tracking paper 
+        shape0_s = 1
+        rate0_s = self.s0_y * shape0_s
+        shape_s = shape0_s + 0.5 * self.N 
+        rate_s = rate0_s + 0.5 * np.sum(innovation**2)
+        self.s_y = shape_s / rate_s
             
         if not self.l_y:
             self.l_y = self.l0_y
-        # If we are running an optimiser, l_y should be set by the optimiser function.
-    
-        times_flat = self.times[:, np.newaxis]        
-        distances = times_flat.T - times_flat # Ntest x N
+        
+        test_times = self.times[self.test_idxs, :].flatten()[:, np.newaxis]
+        train_times = self.times.flatten()[:, np.newaxis]        
+        distances = test_times.T - train_times.T # Ntest x N
         
         K = self.s_y * np.exp(- 0.5 * distances**2 / self.l_y**2 ) # squared exponential kernel
-                
-        innovation = self.x - (self.mu0_y * self.a + self.c) # observation minus prior over forecasters' predictions
-        innovation = innovation.flatten()[:, np.newaxis]
 
         # need to remove the test indexes as they have no observation noise
         amat = np.diag((self.a + np.sqrt(self.v_a)).flatten())
         b = np.zeros((self.N, self.F))
         b[self.test_idxs, :] = self.b[self.test_idxs, :] 
         b = b.flatten()
-        Lambda_e = self.Lambda_e.flatten()
-        self.invS_y = amat.T.dot(np.linalg.inv(amat.dot(K).dot(amat.T)
-                                                 + np.diag(1.0/(b * Lambda_e)) )) # + self.v_c
+        Lambda_e = self.Lambda_e.flatten()[:, np.newaxis]
+        
+        self.invS_y = amat.T.dot(np.linalg.inv(amat.dot(K).dot(amat.T) + b * Lambda_e))
+        
         self.y[self.test_idxs, :] = self.mu0_y + K.dot(self.invS_y).dot(innovation)[self.test_idxs, :]
         self.cov_y = K - K.dot(self.invS_y).dot(amat).dot(K)
         self.v_y[self.test_idxs, :] = np.diag(self.cov_y)[self.test_idxs] # should we really be using this, not cov_y, as it will overestimate variance?
             
     def expec_a(self):
         # update hyperparameters as necessary
-        if not self.s_a:
-            self.s_a = self.s0_a
-#         else:
-#             self.s_a = # variational update -- see gpgrid and the bird tracking paper 
-            
-        if not self.l_time:
-            self.l_time = self.l0_time
-        if not self.l_target:
-            self.l_target = self.l0_target#
-        # If we are running an optimiser, l_y should be set by the optimiser function.
-        d_time = self.times[np.newaxis, :] - self.times[:, np.newaxis]
-        d_y = self.y.T - self.y # using first and second order Taylor expansions for the uncertain inputs.
-        
-        K_time = np.exp(- 0.5 * d_time**2 / self.l_time**2 ) # squared exponential kernel
-        K_y = np.exp(- 0.5 * d_y**2 / self.l_target**2 ) # squared exponential kernel
-        K = self.s_a * K_time * K_y
-        
-        y = np.diag(self.y + np.sqrt(self.v_y))
+        y = np.diag(self.y + np.sqrt(self.v_y)) # use this to compute E[y^2]
         
         for f in range(self.F):
             innovation = self.x[:, f] - (self.y * self.mu0_a + self.c) # observation minus prior over forecasters' predictions 
-            invS = np.linalg.inv(y.dot(K).dot(y) + np.linalg.inv(self.b[f]*self.Lambda_e[f]))# + self.v_c)
+
+            rate0_s = self.s0_a
+            shape_s = 1 + 0.5 * self.N 
+            rate_s = rate0_s + 0.5 * np.sum(innovation**2)
+            self.s_a[f] = shape_s / rate_s
+            K = self.s_a[f] * self.K       
+            
+            invS = np.linalg.inv(y.dot(K).dot(y) + np.linalg.inv(self.b[:, f] * self.Lambda_e[:, f]))
             kalmangain = K.dot(self.y).dot(invS)
             self.a[:, f] = kalmangain.dot(innovation)
             cov_a = K - kalmangain.dot(y).dot(K)
@@ -231,82 +248,48 @@ class BayesianForecasterCombination():
     def expec_c(self):        
         # Apply same treatment as done to expec a.
         # update hyperparameters as necessary
-        if not self.s_c:
-            self.s_c = self.s0_c
-#         else:
-#             self.s_c = # variational update -- see gpgrid and the bird tracking paper 
 
-        if not self.l_time:
-            self.l_time = self.l0_time
-        if not self.l_target:
-            self.l_target = self.l0_target#
+        for f in range(self.F):      
+            innovation = self.x[:, f] - (self.y * self.a + self.mu0_c) # observation minus prior over forecasters' predictions
             
-        # If we are running an optimiser, l_y should be set by the optimiser function.
-        d_time = self.times[np.newaxis, :] - self.times[:, np.newaxis]
-        d_y = self.y.T - self.y
-        
-        K_time = np.exp(- 0.5 * d_time**2 / self.l_time**2 ) # squared exponential kernel
-        K_y = np.exp(- 0.5 * d_y**2 / self.l_target**2 ) # squared exponential kernel
-        K = self.s_c * K_time * K_y
-        
-        innovation = self.x - self.y * self.a - self.mu0_c # observation minus prior over forecasters' predictions 
-        kalmangain = K.dot(np.linalg.inv(K + np.linalg.inv(self.Lambda_e*self.b)))# + self.v_y * (self.a**2 + self.v_a))
-        self.c = kalmangain.dot(innovation)
-        cov_c = K - kalmangain.dot(K)
-        self.v_c = np.diag(cov_c)                
+            rate0_s = self.s0_c
+            shape_s = 1 + 0.5 * self.N 
+            rate_s = rate0_s + 0.5 * np.sum(innovation**2)
+            self.s_c[f] = shape_s / rate_s
+            K = self.s_c[f] * self.K             
+            
+            kalmangain = K.dot(np.linalg.inv(K + np.linalg.inv(self.Lambda_e[:, f] * self.b[:, f])))
+            self.c[:, f] = kalmangain.dot(innovation)
+            cov_c = K - kalmangain.dot(K)
+            self.v_c[:, f] = np.diag(cov_c)                
                 
-    def expec_b_and_e(self):
-        # Check that the updates for Lambda fit with those of a wishart. Should the updates for lambda also be for a (inverse) wishart? 
+    def expec_e(self):
+        innovation = self.x - (self.mu0_y * self.a + self.c) # N x F
+        innovation = innovation + np.sqrt(self.v_a * self.mu0_y**2) 
         
-        # update hyperparameters as necessary
-        if not self.s_e:
-            self.s_e = self.s0_e
-            self.s_b = self.s0_b
-            self.s_lambda = self.s0_lambda
-#         else:
-#             self.s_c = # variational update -- see gpgrid and the bird tracking paper 
-            
-        if not self.l_time:
-            self.l_time = self.l0_time
-        if not self.l_target:
-            self.l_target = self.l0_target
-        # If we are running an optimiser, l_y should be set by the optimiser function.
-        d_time = self.times[np.newaxis, :] - self.times[:, np.newaxis]
-        d_y = self.y.T - self.y
-        
-        K_time = np.exp(- 0.5 * d_time**2 / self.l_time**2 ) # squared exponential kernel
-        K_y = np.exp(- 0.5 * d_y**2 / self.l_target**2 ) # squared exponential kernel
-        K_b = self.s_b * K_time * K_y
-        K_e = self.s_e * K_time * K_y
-        K_lambda = self.s_lambda * K_time * K_y
-        
-        innovation = self.x - self.mu0_y * self.a - self.c # N x F
-        
-        # UPDATE b ---------------------------
         for f in range(self.F):
-            # rate b is now square for each f because b relates to precision of e. Check the other equations involving b make sense.
-            self.shape_b = (self.lambda_e[f] + 1.0)
-            # How is lambda_e prior parameter for both shape and rate?
-            # Put the additional variance due to E[a^2] = E[a]^2 + V[a] in here and for the uncertainty in y -- think we just need self.v_a?
-            pairwise_dev_prods = np.linalg.inv(K_b)
-            self.rate_b = np.linalg.inv(pairwise_dev_prods + innovation[:, f].dot(innovation[f, :])) * self.Lambda_e[f]
+            inn_f = innovation[:, f][:, np.newaxis]
             
-    #         sum_sq_deviations = K_b.dot(innovation**2 + self.v_a + (self.a**2 + self.v_a) * self.v_y[:, np.newaxis]) * self.Lambda_e # N x F # + self.v_c
+            rate0_s = self.s0_e
+            shape_s = 1 + 0.5 * self.N 
+            rate_s = rate0_s + 0.5 * np.sum(inn_f**2)
+            self.s_e[f] = shape_s / rate_s
+            K = self.s_e[f] * self.K            
+                
+            aKa = self.a[:, f].dot(K).dot(self.a[:, f]) + self.v_a[:, f].dot(K)
             
-            self.b = self.shape_b / self.rate_b # expectation of b
-            expec_log_b = psi(self.shape_b) - np.log(self.rate_b)
+            # UPDATE b --------------------------- Check against bird paper.            
+            self.shape_b[f] = 0.5 * (self.lambda_e[f] + 1.0)            
+            self.rate_b[:, f] = 0.5 * (self.lambda_e[f] + np.diag(aKa + inn_f.dot(inn_f.T)) * self.Lambda_e[:, f])
+            self.b[:, f] = self.shape_b[:, f] / self.rate_b[f]
+            expec_log_b = psi(self.shape_b[f]) - np.log(self.rate_b[:, f])
                     
             # UPDATE lambda -----------------------
-            # How is this derived?
-            self.shape_lambda = self.shape0_lambda + np.sum(K_lambda, axis=1)[:, np.newaxis] * 0.5 # Nx1
-            self.rate_lambda = self.rate0_lambda - 0.5 * K_lambda.dot(1 + expec_log_b - self.b) # NxF
-            self.lambda_e = self.shape_lambda / self.rate_lambda # N x F
+            self.shape_lambda[f] = self.shape0_lambda + 0.5 * self.N
+            self.rate_lambda[f] = self.rate0_lambda - 0.5 * np.sum(1 + expec_log_b - self.b[:, f])
+            self.lambda_e[f] = self.shape_lambda[f] / self.rate_lambda[f]
     
-            # UPDATE Lambda ------------------------
-            self.shape_Lambda = self.shape0_Lambda + 0.5#np.sum(K_e, axis=1)[:, np.newaxis] * 0.5 # Nx1
-            # change this!
-            pairwise_dev_prods = np.linalg.inv(K_e)
-            sum_sq_deviations = np.linalg.inv(pairwise_dev_prods + innovation[:, f].dot(innovation[f, :])) * self.b 
-#             sum_sq_deviations = K_e.dot( innovation**2 + self.v_a + (self.a**2 + self.v_a) * self.v_y[:, np.newaxis]) * self.b # N x F #  + self.v_c
-            self.rate_Lambda = self.rate0_Lambda + 0.5 * sum_sq_deviations   
-            self.Lambda_e = self.shape_Lambda / self.rate_Lambda
+            # UPDATE Lambda ------------------------ Could we also compute this using GP equations?
+            self.shape_Lambda[:, f] = self.shape0_Lambda + 1
+            self.rate_Lambda[:, f] = self.rate0_Lambda + np.diag(aKa + inn_f.dot(inn_f.T)) * self.b[:, f]   
+            self.Lambda_e[:, f] = self.shape_Lambda[:, f] / self.rate_Lambda[:, f]
