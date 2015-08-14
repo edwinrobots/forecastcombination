@@ -219,6 +219,7 @@ class BayesianForecasterCombination():
             cov_f = K - V.T.dot(V)
             
         self.y[self.testidxs, :] = mu_f[self.testidxs]
+        # WHY IS COV ENDING UP ALL ZEROS? DOES IT NEED TO BE FLOAT?
         cov[self.testidxs][:, self.testidxs] = cov_f
         self.cov_y = cov
         
@@ -274,7 +275,7 @@ class BayesianForecasterCombination():
             V = solve_triangular(Lc, K, check_finite=False, lower=True)            
             
             self.c[:, f] = self.mu0_c + K.dot(A).reshape(-1)
-            self.cov_c[f] = K - V.T.dot(V) # WHY DO SOME DIAGONALS IN THE TRAINING IDXS END UP < 0? RELATED TO LOWER S_C VALUES?
+            self.cov_c[f] = K - V.T.dot(V) # WHY DO SOME DIAGONALS IN THE TRAINING IDXS END UP < 0? RELATED TO LOWER S_C VALUES? -- TRY FIXING COV_Y FIRST. ALSO CHECK Y_DIAG.COV_A.Y_DIAG
             
             rate0_s = self.s0_c
             shape_s = 1 + 0.5 * self.N 
