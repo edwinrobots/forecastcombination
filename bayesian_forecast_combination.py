@@ -8,10 +8,15 @@ import numpy as np
 from scipy.special import psi
 from scipy.linalg import block_diag, cholesky, solve_triangular
 import logging
+from statsmodels.tsa.vector_ar.var_model import var_acf
 
 class BayesianForecasterCombination():
     """
     Bayesian Crowd Forecasting? Indepenedent...
+    
+    # TO DO:
+    # 1. Prediction function not returning the right results -- needs to include observed values of x when available.
+    # 2. Kernel for time dimension needs to be changed to a linear one as in simulated data sampler. 
     """ 
     # Data Dimensions --------------------------------------------------------------------------------------------------
     F = 1 # number of forecasters
@@ -34,18 +39,16 @@ class BayesianForecasterCombination():
     mu0_c = 0 # Prior mean bias
     s0_c = 1 # output scale of bias
     
-    mu0_y = 0 # Prior for the targets
+    m_mu0_y = 0 # Hyperprior for the targets
+    v_mu0_y = 1 
     l0_y = 10 # length scale for the targets
     s0_y = 1 # output scale for the targets    
     
-    shape0_b = 1 # Priors for the noise
-    rate0_b = 1
-    
     shape0_Lambda = 1 
-    rate0_Lambda = 1
+    scale0_Lambda = 1
     
     shape0_lambda = 1
-    rate0_lambda = 1 
+    scale0_Lambda = 1 
         
     def __init__(self, x, y, times, periods):
         # Observations -------------------------------------------------------------------------------------------------
@@ -67,13 +70,15 @@ class BayesianForecasterCombination():
         self.testidxs = np.isnan(self.y).flatten()
         self.trainidxs = (np.isnan(self.y) == False).flatten()
 
-        self.y[self.testidxs, :] = self.mu0_y 
+        self.y[self.testidxs, :] = self.m_mu0_y 
                 
         # N time values. If none are give, we assume that the N observations are in time order and evenly spaced.        
         times = np.array(times, dtype=float)
         if times.ndim==1:
             times = times[:, np.newaxis]            
         self.times = times
+        
+        self.T = np.max(self.times) + 1
                     
         if not self.l_time:
             self.l_time = self.l0_time
@@ -81,39 +86,63 @@ class BayesianForecasterCombination():
             self.l_target = self.l0_target
             
         periods = np.array(periods)
-        if periods.ndim==1:
-            periods = periods[:, np.newaxis]
+        if periods.ndim == 2:
+            periods = periods.reshape(-1)
         self.periods = periods # N index values indicating which period each forecast relates to.
+        
+        self.P = np.max(self.periods) + 1
 
         # Model Parameters (latent variables) ------------------------------------------------------------------------------
+        
+        d_time = self.times - self.times.T    
+        self.K_time = self.sqexpkernel(d_time, self.l_time)
+        
+        d_y = self.y - self.y.T # using first and second order Taylor expansions for the uncertain inputs.
+        self.K_target = self.sqexpkernel(d_y, self.l_target)
+        self.K = self.K_time * self.K_target + 1e-6 * np.eye(self.N)
+        
         # Posterior expectations at each data point
         self.a = np.ones((self.N, self.F)) # Inverse signal strength for the ground truth. Varies depending on y and time.
+        self.s_a = np.zeros(self.F) + self.s0_a        
         self.cov_a = np.zeros((self.F, self.N, self.N))
-        self.cov_a[:, np.arange(self.N), np.arange(self.N)] += 1
-        self.s_a = np.zeros(self.F) + self.s0_a
-        self.mu0_a = np.zeros(self.N) + self.mu0_a
+        for f in range(self.F):
+            self.cov_a[f, :, :] = self.s_a[f] * self.K
         
         self.c = np.zeros((self.N, self.F)) # Bias offset. Expected value = posterior mean. Varies depending on y and time.   
-        self.cov_c = np.zeros((self.F, self.N, self.N))
-        self.cov_c[:, np.arange(self.N), np.arange(self.N)] += 1
         self.s_c = np.zeros(self.F) + self.s0_c
-                
-        self.e = np.zeros((self.N, self.F)) # Noise value for individual data points. Prior mean zero.
-        self.cov_e = np.zeros((self.F, self.N, self.N))
-        self.cov_e[:, np.arange(self.N), np.arange(self.N)] += 1
+        self.cov_c = np.zeros((self.F, self.N, self.N))
+        for f in range(self.F):
+            self.cov_c[f, :, :] = self.s_c[f] * self.K
         
         self.b = np.ones((self.P, self.F)) # Noise precision scale, one value for each run/period.        
-        
         self.Lambda_e = {} # F x N x N Noise precision varies over y and time. 
+        
+        self.e = np.zeros((self.N, self.F)) # Noise value for individual data points. Prior mean zero.
+        self.cov_e = {}
+        for f in range(self.F):
+            shape_Lambda = self.shape0_Lambda
+            scale_Lambda = self.scale0_Lambda * self.K_time[0:self.T, :][:, 0:self.T]
+            self.Lambda_e[f] = scale_Lambda / shape_Lambda
+            for p in range(self.P):
+                pidxs = self.periods==p
+                self.cov_e[f] = np.zeros((self.N, self.N)) 
+                self.cov_e[f][np.ix_(pidxs, pidxs)] = self.Lambda_e[f] * self.K_target[pidxs][:, pidxs] / self.b[p, f] + np.eye(self.T) * 1e-6
+        
         self.lambda_e = np.zeros(self.F) # F degrees of freedom in student's t noise distribution. Constant for each forecaster.
         
-        self.cov_y = np.zeros((self.N, self.N))
-        self.cov_y[np.arange(self.N), np.arange(self.N)] += 1
+        distances = self.times - self.times.T # Ntest x N
+        nonmatchingperiods = (self.periods - self.periods.T) != 0
+        distances[nonmatchingperiods] = np.inf
+        
+        self.l_y = self.l0_y
         self.s_y = self.s0_y
-        self.mu0_y = np.zeros((self.N, 1))
+        self.K_y = self.sqexpkernel(distances, self.l_y) + 1e-6 * np.eye(self.N)
+        self.cov_y = self.s_y * self.K_y
+        self.cov_y[self.trainidxs, :] = 0
+        self.cov_y[:, self.trainidxs] = 0
             
     def sqexpkernel(self, d, l):
-        K = np.exp(- 0.5 * d*2 / l**2 ) + 1e-6 * np.ones(d.shape)
+        K = np.exp(- 0.5 * d**2 / l**2 )
         return K
             
     def fit(self):
@@ -124,103 +153,109 @@ class BayesianForecasterCombination():
         change = np.inf
         maxiter = 100
         niter = 0
-
-        d_time = self.times - self.times.T        
-        K_time = self.sqexpkernel(d_time, self.l_time)
         
         while change > tolerance and niter < maxiter:
             
-            logging.debug("Iteration " + str(niter))
+            y_old = np.copy(self.y)
             
-            y_old = self.y
-            
-            d_y = self.y.T - self.y # using first and second order Taylor expansions for the uncertain inputs.
-            
-            K_y = self.sqexpkernel(d_y, self.l_target)
-            self.K = K_time * K_y
+            d_y = self.y - self.y.T # using first and second order Taylor expansions for the uncertain inputs.
+            self.K_target = self.sqexpkernel(d_y, self.l_target)
+            self.K = self.K_time * self.K_target + 1e-6 * np.eye(self.N)
             self.L_K = cholesky(self.K, lower=True, check_finite=False, overwrite_a=False)            
             
-            self.expec_y() # begin by estimating y from sensible priors
-            self.expec_c() # find the added bias
+            self.expec_y() # begin by estimating y from sensible priors         
+            self.expec_c() # find the added bias            
             self.expec_a() # find any scaling bias
             self.expec_e() # find the noise values
-            self.expec_Lambda_b() # find the noise parameters common to all runs
+            self.expec_Lambda_b() # find the noise parameters common to all runs   
             
             change = np.max(np.abs(self.y - y_old))
             niter += 1
+            
+            logging.debug("Completed iteration " + str(niter) + ", change = " + str(change))            
     
     def predict(self, testtimes, testperiods):
         """
         Use the posterior GP over y to interpolate and predict the specified times and periods.
         """
-        distances = testtimes[:, np.newaxis] - self.times.T
+        train_times = self.times
+        distances = train_times - train_times.T # Ntest x N        
+        train_periods = self.periods[:, np.newaxis]
+        nonmatchingperiods = (train_periods - train_periods.T) != 0
+        distances[nonmatchingperiods] = np.inf
+        K_train_train = self.s_y * self.sqexpkernel(distances, self.l_y) + 1e-6 * np.eye(self.N)
+        
+        testtimes = np.array(testtimes, dtype=float)
+        if testtimes.ndim == 1:
+            testtimes = testtimes[:, np.newaxis]
+        distances = testtimes - self.times.T
+        nonmatchingperiods = (testperiods - train_periods.T) != 0
+        distances[nonmatchingperiods] = np.inf
         K_test_train = self.s_y * self.sqexpkernel(distances, self.l_y) # squared exponential kernel   
 
-        distances = testtimes[np.newaxis, :] - testtimes[:, np.newaxis]
+        distances = testtimes - testtimes.T
+        nonmatchingperiods = (testperiods - testperiods.T) != 0
+        distances[nonmatchingperiods] = np.inf
         K_test_test = self.s_y * self.sqexpkernel(distances, self.l_y) # squared exponential kernel
                 
-        innovation = self.x - (self.mu0_y * self.a + self.c) # observation minus prior over forecasters' predictions
-        innovation = innovation.flatten()[:, np.newaxis]
-        B = solve_triangular(self.Ly, innovation.T, lower=True, overwrite_b=True)
-        A = solve_triangular(self.Ly.T, B, overwrite_b=True)        
+        innovation = self.y - self.mu0_y
+        var_y = np.diag(np.diag(self.cov_y))
+        L_y = cholesky(K_train_train + var_y, lower=True, check_finite=False, overwrite_a=False)
+        B = solve_triangular(L_y, innovation, lower=True, overwrite_b=True)
+        A = solve_triangular(L_y.T, B, overwrite_b=True)        
         y = self.mu0_y + K_test_train.dot(A)
         
-        amat = np.diag((self.a + np.sqrt(self.v_a)).flatten())
-        V = solve_triangular(self.Ly, amat.T.dot(K_test_train.T), lower=True, overwrite_b=True)        
+        V = solve_triangular(L_y, K_test_train.T, lower=True, overwrite_b=True)        
         v_y = np.diag(K_test_test - V.T.dot(V))
         
         return y, v_y    
  
     def expec_y(self):                    
-        if not self.l_y:
-            self.l_y = self.l0_y
+        K = self.s_y * self.K_y
         
-        train_times = self.times
-        distances = train_times - train_times.T # Ntest x N        
-        
-        train_periods = self.periods
-        nonmatchingperiods = (train_periods - train_periods.T) != 0
-        distances[nonmatchingperiods] = np.inf
-        
-        Kprior = self.sqexpkernel(distances, self.l_y)
-        K = self.s_y * Kprior
+        # update the prior mean
+        v_obs_y = np.var(self.y)
+        self.mu0_y = (self.m_mu0_y * v_obs_y + np.mean(self.y) * self.v_mu0_y) / (self.v_mu0_y + v_obs_y)
+        print "mu0_y = %.3f" % self.mu0_y
         
         # learn from the training labels
-        innovation = self.y[self.trainidxs, :] - self.mu0_y[self.trainidxs, :]
+        innovation = self.y[self.trainidxs, :] - self.mu0_y
         L_y = cholesky(K[self.trainidxs, :][:, self.trainidxs], lower=True, check_finite=False, overwrite_a=False)
         B = solve_triangular(L_y, innovation, lower=True, overwrite_b=True, check_finite=False)
         A = solve_triangular(L_y.T, B, overwrite_b=True, check_finite=False)
-        V = solve_triangular(L_y, K[self.trainidxs][:, self.testidxs], lower=True, check_finite=False)
+        V = solve_triangular(L_y, K[self.trainidxs, :], lower=True, check_finite=False)
         
-        mu_f = K[self.testidxs][:, self.trainidxs].dot(A)                
-        cov = np.zeros((self.N, self.N))
-        cov_f = K[self.testidxs][:, self.testidxs] - V.T.dot(V)
+        mu = self.mu0_y + K[self.testidxs][:, self.trainidxs].dot(A)                
+        cov = K - V.T.dot(V)
         # now update the test indexes from the x  observations
         for f in range(self.F):
-            mu_fminus1 = mu_f
-            K = cov_f
+            mu_fminus1 = mu
+            cov_f = cov[self.testidxs][:, self.testidxs] + 1e-6 * np.eye(np.sum(self.testidxs)) # jitter
             
             innovation = self.x[self.testidxs, f:f+1] - (mu_fminus1 * self.a[self.testidxs, f:f+1] 
                                                      + self.c[self.testidxs, f:f+1] + self.e[self.testidxs, f:f+1]) # observation minus prior over forecasters' predictions
+            print np.min(innovation)
             a_diag = np.diag(self.a[self.testidxs, f])
 
-            S_y = a_diag.T.dot(K).dot(a_diag)
-            cov_a = self.cov_a[f, self.testidxs][:, self.testidxs]
-            cov_a = np.diag(mu_fminus1.reshape(-1)).dot(cov_a).dot(np.diag(mu_fminus1.reshape(-1)).T)
-            S_y += cov_a + self.cov_e[f, self.testidxs][:, self.testidxs] + self.cov_c[f, self.testidxs][:, self.testidxs]
+            S_y = cov_f 
+            var_a = np.diag(np.diag(self.cov_a[f, self.testidxs][:, self.testidxs]))
+            var_a = np.diag(mu_fminus1.reshape(-1)).dot(var_a).dot(np.diag(mu_fminus1.reshape(-1)).T)
+            var_e = np.diag(np.diag(self.cov_e[f][self.testidxs][:, self.testidxs]))
+            var_c = np.diag(np.diag(self.cov_c[f, self.testidxs][:, self.testidxs]))
+            S_y += var_a + var_e + var_c 
             
             L_y = cholesky(S_y, lower=True, check_finite=False, overwrite_a=True)
             
             B = solve_triangular(L_y, innovation, lower=True, overwrite_b=True, check_finite=False)
             A = solve_triangular(L_y.T, B, overwrite_b=True, check_finite=False)
-            V = solve_triangular(L_y, a_diag.dot(K), lower=True, overwrite_b=True, check_finite=False)
+            V = solve_triangular(L_y, a_diag.dot(cov[self.testidxs, :]), lower=True, overwrite_b=True, check_finite=False)
         
-            mu_f = mu_fminus1 + K.dot(a_diag).dot(A)
-            cov_f = K - V.T.dot(V)
+            mu = mu_fminus1 + cov_f.dot(a_diag).dot(A)
+            cov = cov - V.T.dot(V)
             
-        self.y[self.testidxs, :] = mu_f[self.testidxs]
-        # WHY IS COV ENDING UP ALL ZEROS? DOES IT NEED TO BE FLOAT?
-        cov[self.testidxs][:, self.testidxs] = cov_f
+        self.y[self.testidxs, :] = mu
+        cov[self.trainidxs, :] = 0
+        cov[:, self.trainidxs] = 0
         self.cov_y = cov
         
         # update hyper-parameters as necessary
@@ -228,7 +263,7 @@ class BayesianForecasterCombination():
         rate0_s = self.s0_y * shape0_s
         shape_s = shape0_s + 0.5 * self.N 
         
-        L_Ky = cholesky(Kprior, lower=True, check_finite=False, overwrite_a=True)  
+        L_Ky = cholesky(self.K_y, lower=True, check_finite=False, overwrite_a=True)  
         
         B = solve_triangular(L_Ky, self.y.dot(self.y.T).T + self.cov_y, lower=True, overwrite_b=True)
         A = solve_triangular(L_Ky.T, B, overwrite_b=True)
@@ -242,13 +277,17 @@ class BayesianForecasterCombination():
             K = self.s_a[f] * self.K       
             
             y_diag = np.diag(self.y.reshape(-1))
-            diag_mu0_a = np.diag(self.mu0_a)
-            S_a = y_diag.dot(K).dot(y_diag.T) + diag_mu0_a.dot(self.cov_y).dot(diag_mu0_a.T) + self.cov_c[f] + self.cov_e[f]
+            
+            var_y = np.diag(np.diag(self.cov_y))
+            var_c = np.diag(np.diag(self.cov_c[f]))
+            var_e = np.diag(np.diag(self.cov_e[f]))
+            
+            S_a = y_diag.dot(K).dot(y_diag.T) + self.mu0_a**2 * var_y + var_c + var_e
             La = cholesky(S_a, lower=True, overwrite_a=True, check_finite=False)
             B = solve_triangular(La, innovation, lower=True, overwrite_b=True, check_finite=False)
             A = solve_triangular(La.T, B, overwrite_b=True, check_finite=False)           
             V = solve_triangular(La, y_diag.dot(K), check_finite=False, lower=True)
-            self.a[:, f] = K.dot(self.y).dot(A)
+            self.a[:, f] = self.mu0_a + K.dot(y_diag).dot(A).reshape(-1)
             self.cov_a[f] = K - V.T.dot(V)
 
             rate0_s = self.s0_a
@@ -268,7 +307,12 @@ class BayesianForecasterCombination():
             K = self.s_c[f] * self.K
             y_diag = np.diag(self.y[:, 0])             
             a_diag = np.diag(self.a[:, f])
-            S_c = K + y_diag.dot(self.cov_a[f]).dot(y_diag.T) + a_diag.dot(self.cov_y).dot(a_diag.T) + self.cov_e[f]
+            
+            var_a = np.diag(np.diag(self.cov_a[f])) 
+            var_y = np.diag(np.diag(self.cov_y))
+            var_e = np.diag(np.diag(self.cov_e[f]))
+            
+            S_c = K + y_diag.dot(var_a).dot(y_diag.T) + a_diag.dot(var_y).dot(a_diag.T) + var_e
             Lc = cholesky(S_c, lower=True, overwrite_a=True, check_finite=False)
             B = solve_triangular(Lc, innovation, lower=True, overwrite_b=True, check_finite=False)
             A = solve_triangular(Lc.T, B, overwrite_b=True, check_finite=False)           
@@ -279,14 +323,14 @@ class BayesianForecasterCombination():
             
             rate0_s = self.s0_c
             shape_s = 1 + 0.5 * self.N 
-            cf = self.c[:, f][:, np.newaxis]
+            cf = self.c[:, f][:, np.newaxis] - self.mu0_c
             
             B = solve_triangular(self.L_K, cf.T + self.cov_c[f].T, lower=True, overwrite_b=True)
             A = solve_triangular(self.L_K.T, B, overwrite_b=True)       
             
             rate_s = rate0_s + 0.5 * np.trace(A)
             self.s_c[f] = shape_s / rate_s
-                
+
     def expec_e(self):
         """
         Noise of each observation
@@ -301,19 +345,24 @@ class BayesianForecasterCombination():
             for p in range(self.P):
                 pidxs = self.periods==p
                 inn_fp = inn_f[pidxs]
-                 
-                prior_precision = self.Lambda_e[f] * self.b[p, f]
-                K = 1.0 / prior_precision
+                                 
+                K = self.K_target[pidxs][:, pidxs] * self.Lambda_e[f] / self.b[p, f] + 1e-6 * np.eye(self.T)
                 
-                Se = K + self.cov_c[f][pidxs][pidxs] + self.y[pidxs, :] * self.cov_a[f][pidxs][pidxs] * self.y[pidxs, :].T + \
-                        self.a[pidxs, f][:, np.newaxis] * self.cov_y[pidxs][pidxs] * self.a[pidxs, f][np.newaxis, :]
+                a_diag = np.diag(self.a[pidxs, f])
+                y_diag = np.diag(self.y[pidxs, 0])
+                
+                var_c = np.diag(np.diag(self.cov_c[f][pidxs][:, pidxs]))
+                var_a = np.diag(np.diag(self.cov_a[f][pidxs][:, pidxs]))
+                var_y = np.diag(np.diag(self.cov_y[pidxs][:, pidxs]))
+                
+                Se = K + var_c + y_diag.dot(var_a).dot(y_diag.T) + a_diag.dot(var_y).dot(a_diag.T)
                 Le = cholesky(Se, lower=True, overwrite_a=True, check_finite=False)
                 B = solve_triangular(Le, inn_fp, lower=True, overwrite_b=True, check_finite=False)
                 A = solve_triangular(Le.T, B, overwrite_b=True, check_finite=False)           
                 V = solve_triangular(Le, K, check_finite=False, lower=True)   
                 
-                self.e[pidxs, f] = K.dot(A)
-                self.cov_e[f][pidxs, :][:, pidxs] = K - V.T.dot(V)
+                self.e[pidxs, f] = K.dot(A).reshape(-1)
+                self.cov_e[f][np.ix_(pidxs, pidxs)] = K - V.T.dot(V) 
         
     def expec_Lambda_b(self):
         """
@@ -321,27 +370,32 @@ class BayesianForecasterCombination():
         """              
         for f in range(self.F):                         
             # UPDATE Lambda ------------------------       
-            self.Lambda_e[f] = {} # we'll need P separate matrices because the target values y and times can differ
-            shape_Lambda = self.shape0_Lambda + self.P
-            rate_Lambda = self.K
+            shape_Lambda = self.T + 1 + self.shape0_Lambda + self.P
+            scale_Lambda = self.scale0_Lambda * self.K_time[0:self.T, :][:, 0:self.T]
             for p in range(self.P):
                 pidxs = self.periods==p
-                inn_f = self.e[pidxs, f] # deviations from mean of 0
-                inn_fp = inn_f.dot(inn_f) + self.cov_e[f][pidxs][:, pidxs]
-                rate_Lambda += inn_fp * self.b[p, f] # should there be separate b values for each data point? i.e. we would use self.b[f][pidx,pidxs]
-            self.Lambda_e[f] = shape_Lambda / rate_Lambda # P x P                            
+                inn_f = self.e[pidxs, f:f+1] # deviations from mean of 0
+                inn_fp = inn_f.dot(inn_f.T) + self.cov_e[f][pidxs][:, pidxs]
+                scale_Lambda += inn_fp / self.K_target[pidxs][:, pidxs] * self.b[p, f]
+            self.Lambda_e[f] = scale_Lambda / (shape_Lambda - self.T - 1)# P x P                            
                             
             # UPDATE b --------------------------- Check against bird paper.            
-            shape_b = self.lambda_e[f] + 1.0
+            shape_b = self.lambda_e[f] + self.T/2.0
             expec_log_b = np.zeros(self.P)
             for p in range(self.P):
                 pidxs = self.periods==p
                 inn_f = self.e[pidxs, f]
-                inn_fp = inn_f.dot(inn_f) + self.cov_e[f][pidxs][:, pidxs]                 
-                rate_b = self.lambda_e[f] + np.trace(inn_fp * self.Lambda_e[f][p])
+                var_e = np.diag(np.diag(self.cov_e[f][pidxs][:, pidxs]))
+                inn_fp = inn_f.dot(inn_f) + var_e            
+                
+                L_Lambda = cholesky(self.Lambda_e[f] * self.K_target[pidxs][:, pidxs] + 1e-6  * np.eye(self.T), lower=True, check_finite=False)
+                B = solve_triangular(L_Lambda, inn_fp, overwrite_b=True, check_finite=False, lower=True)
+                A = solve_triangular(L_Lambda.T, B, overwrite_b=True, check_finite=False)
+                rate_b = self.lambda_e[f] + np.trace(A)/2.0
                 self.b[p, f] = shape_b / rate_b
-                expec_log_b[p] = psi(shape_b) - np.log(rate_b)                        
+                expec_log_b[p] = psi(shape_b) - np.log(rate_b)
+                       
             # UPDATE lambda -----------------------
             shape_lambda = self.shape0_lambda + 0.5 * self.N
-            rate_lambda = self.rate0_lambda - 0.5 * np.sum(1 + expec_log_b - self.b[:, f])
-            self.lambda_e[f] = shape_lambda / rate_lambda            
+            scale_Lambda = self.scale0_Lambda - 0.5 * np.sum(1 + expec_log_b - self.b[:, f])
+            self.lambda_e[f] = shape_lambda / scale_Lambda            
