@@ -6,9 +6,8 @@ Created on 31 Jul 2015
 
 import numpy as np
 from scipy.special import psi
-from scipy.linalg import block_diag, cholesky, solve_triangular
+from scipy.linalg import cholesky, solve_triangular
 import logging
-from statsmodels.tsa.vector_ar.var_model import var_acf
 
 class BayesianForecasterCombination():
     """
