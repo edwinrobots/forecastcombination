@@ -5,3 +5,5 @@ plotting_gen.pyc
 python_gen.pyc
 set_physical_constants.pyc
 stat_sig_gen.pyc
+/bayesian_forecast_combination.pyc
+/wishart.pyc
